@@ -1,17 +1,16 @@
 package common
 
 import (
-	"golang.org/x/net/idna"
 	"strings"
 
-	C "github.com/Dreamacro/clash/constant"
+	C "github.com/metacubex/mihomo/constant"
+	"golang.org/x/net/idna"
 )
 
 type DomainSuffix struct {
 	*Base
 	suffix  string
 	adapter string
-	isIDNA  bool
 }
 
 func (ds *DomainSuffix) RuleType() C.RuleType {
@@ -28,20 +27,15 @@ func (ds *DomainSuffix) Adapter() string {
 }
 
 func (ds *DomainSuffix) Payload() string {
-	suffix := ds.suffix
-	if ds.isIDNA {
-		suffix, _ = idna.ToUnicode(suffix)
-	}
-	return suffix
+	return ds.suffix
 }
 
 func NewDomainSuffix(suffix string, adapter string) *DomainSuffix {
-	actualDomainSuffix, _ := idna.ToASCII(suffix)
+	punycode, _ := idna.ToASCII(strings.ToLower(suffix))
 	return &DomainSuffix{
 		Base:    &Base{},
-		suffix:  strings.ToLower(actualDomainSuffix),
+		suffix:  punycode,
 		adapter: adapter,
-		isIDNA:  suffix != actualDomainSuffix,
 	}
 }
 

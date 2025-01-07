@@ -1,22 +1,22 @@
 package mixed
 
 import (
-	"github.com/Dreamacro/clash/adapter/inbound"
 	"net"
 
-	"github.com/Dreamacro/clash/common/cache"
-	N "github.com/Dreamacro/clash/common/net"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/listener/http"
-	"github.com/Dreamacro/clash/listener/socks"
-	"github.com/Dreamacro/clash/transport/socks4"
-	"github.com/Dreamacro/clash/transport/socks5"
+	"github.com/metacubex/mihomo/adapter/inbound"
+	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/auth"
+	C "github.com/metacubex/mihomo/constant"
+	authStore "github.com/metacubex/mihomo/listener/auth"
+	"github.com/metacubex/mihomo/listener/http"
+	"github.com/metacubex/mihomo/listener/socks"
+	"github.com/metacubex/mihomo/transport/socks4"
+	"github.com/metacubex/mihomo/transport/socks5"
 )
 
 type Listener struct {
 	listener net.Listener
 	addr     string
-	cache    *cache.LruCache[string, bool]
 	closed   bool
 }
 
@@ -36,13 +36,20 @@ func (l *Listener) Close() error {
 	return l.listener.Close()
 }
 
-func New(addr string, in chan<- C.ConnContext, additions ...inbound.Addition) (*Listener, error) {
+func New(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
+	return NewWithAuthenticator(addr, tunnel, authStore.Default, additions...)
+}
+
+func NewWithAuthenticator(addr string, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) (*Listener, error) {
+	isDefault := false
 	if len(additions) == 0 {
+		isDefault = true
 		additions = []inbound.Addition{
 			inbound.WithInName("DEFAULT-MIXED"),
 			inbound.WithSpecialRules(""),
 		}
 	}
+
 	l, err := inbound.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -51,7 +58,6 @@ func New(addr string, in chan<- C.ConnContext, additions ...inbound.Addition) (*
 	ml := &Listener{
 		listener: l,
 		addr:     addr,
-		cache:    cache.New[string, bool](cache.WithAge[string, bool](30)),
 	}
 	go func() {
 		for {
@@ -62,16 +68,24 @@ func New(addr string, in chan<- C.ConnContext, additions ...inbound.Addition) (*
 				}
 				continue
 			}
-			go handleConn(c, in, ml.cache, additions...)
+			store := store
+			if isDefault || store == authStore.Default { // only apply on default listener
+				if !inbound.IsRemoteAddrDisAllowed(c.RemoteAddr()) {
+					_ = c.Close()
+					continue
+				}
+				if inbound.SkipAuthRemoteAddr(c.RemoteAddr()) {
+					store = authStore.Nil
+				}
+			}
+			go handleConn(c, tunnel, store, additions...)
 		}
 	}()
 
 	return ml, nil
 }
 
-func handleConn(conn net.Conn, in chan<- C.ConnContext, cache *cache.LruCache[string, bool], additions ...inbound.Addition) {
-	conn.(*net.TCPConn).SetKeepAlive(true)
-
+func handleConn(conn net.Conn, tunnel C.Tunnel, store auth.AuthStore, additions ...inbound.Addition) {
 	bufConn := N.NewBufferedConn(conn)
 	head, err := bufConn.Peek(1)
 	if err != nil {
@@ -80,10 +94,10 @@ func handleConn(conn net.Conn, in chan<- C.ConnContext, cache *cache.LruCache[st
 
 	switch head[0] {
 	case socks4.Version:
-		socks.HandleSocks4(bufConn, in, additions...)
+		socks.HandleSocks4(bufConn, tunnel, store, additions...)
 	case socks5.Version:
-		socks.HandleSocks5(bufConn, in, additions...)
+		socks.HandleSocks5(bufConn, tunnel, store, additions...)
 	default:
-		http.HandleConn(bufConn, in, cache, additions...)
+		http.HandleConn(bufConn, tunnel, store, additions...)
 	}
 }

@@ -2,19 +2,15 @@ package sniffer
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
-	"strconv"
-	"sync"
 	"time"
 
-	"github.com/Dreamacro/clash/common/cache"
-	N "github.com/Dreamacro/clash/common/net"
-	"github.com/Dreamacro/clash/component/trie"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/constant/sniffer"
-	"github.com/Dreamacro/clash/log"
+	"github.com/metacubex/mihomo/common/lru"
+	N "github.com/metacubex/mihomo/common/net"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/sniffer"
+	"github.com/metacubex/mihomo/log"
 )
 
 var (
@@ -23,37 +19,75 @@ var (
 	ErrNoClue               = errors.New("not enough information for making a decision")
 )
 
-var Dispatcher *SnifferDispatcher
-
-type SnifferDispatcher struct {
+type Dispatcher struct {
 	enable          bool
 	sniffers        map[sniffer.Sniffer]SnifferConfig
-	forceDomain     *trie.DomainTrie[struct{}]
-	skipSNI         *trie.DomainTrie[struct{}]
-	skipList        *cache.LruCache[string, uint8]
-	rwMux           sync.RWMutex
+	forceDomain     []C.DomainMatcher
+	skipSrcAddress  []C.IpMatcher
+	skipDstAddress  []C.IpMatcher
+	skipDomain      []C.DomainMatcher
+	skipList        *lru.LruCache[netip.AddrPort, uint8]
 	forceDnsMapping bool
 	parsePureIp     bool
 }
 
-func (sd *SnifferDispatcher) TCPSniff(conn net.Conn, metadata *C.Metadata) {
-	bufConn, ok := conn.(*N.BufferedConn)
-	if !ok {
-		return
+func (sd *Dispatcher) shouldOverride(metadata *C.Metadata) bool {
+	for _, matcher := range sd.skipDstAddress {
+		if matcher.MatchIp(metadata.DstIP) {
+			return false
+		}
+	}
+	for _, matcher := range sd.skipSrcAddress {
+		if matcher.MatchIp(metadata.SrcIP) {
+			return false
+		}
+	}
+	if metadata.Host == "" && sd.parsePureIp {
+		return true
+	}
+	if metadata.DNSMode == C.DNSMapping && sd.forceDnsMapping {
+		return true
+	}
+	for _, matcher := range sd.forceDomain {
+		if matcher.MatchDomain(metadata.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+func (sd *Dispatcher) UDPSniff(packet C.PacketAdapter) bool {
+	metadata := packet.Metadata()
+	if sd.shouldOverride(metadata) {
+		for sniffer, config := range sd.sniffers {
+			if sniffer.SupportNetwork() == C.UDP || sniffer.SupportNetwork() == C.ALLNet {
+				inWhitelist := sniffer.SupportPort(metadata.DstPort)
+				overrideDest := config.OverrideDest
+
+				if inWhitelist {
+					host, err := sniffer.SniffData(packet.Data())
+					if err != nil {
+						continue
+					}
+
+					sd.replaceDomain(metadata, host, overrideDest)
+					return true
+				}
+			}
+		}
 	}
 
-	if (metadata.Host == "" && sd.parsePureIp) || sd.forceDomain.Search(metadata.Host) != nil || (metadata.DNSMode == C.DNSMapping && sd.forceDnsMapping) {
-		port, err := strconv.ParseUint(metadata.DstPort, 10, 16)
-		if err != nil {
-			log.Debugln("[Sniffer] Dst port is error")
-			return
-		}
+	return false
+}
 
+// TCPSniff returns true if the connection is sniffed to have a domain
+func (sd *Dispatcher) TCPSniff(conn *N.BufferedConn, metadata *C.Metadata) bool {
+	if sd.shouldOverride(metadata) {
 		inWhitelist := false
 		overrideDest := false
 		for sniffer, config := range sd.sniffers {
 			if sniffer.SupportNetwork() == C.TCP || sniffer.SupportNetwork() == C.ALLNet {
-				inWhitelist = sniffer.SupportPort(uint16(port))
+				inWhitelist = sniffer.SupportPort(metadata.DstPort)
 				if inWhitelist {
 					overrideDest = config.OverrideDest
 					break
@@ -62,56 +96,61 @@ func (sd *SnifferDispatcher) TCPSniff(conn net.Conn, metadata *C.Metadata) {
 		}
 
 		if !inWhitelist {
-			return
+			return false
 		}
 
-		sd.rwMux.RLock()
-		dst := fmt.Sprintf("%s:%s", metadata.DstIP, metadata.DstPort)
+		dst := metadata.AddrPort()
 		if count, ok := sd.skipList.Get(dst); ok && count > 5 {
 			log.Debugln("[Sniffer] Skip sniffing[%s] due to multiple failures", dst)
-			defer sd.rwMux.RUnlock()
-			return
+			return false
 		}
-		sd.rwMux.RUnlock()
 
-		if host, err := sd.sniffDomain(bufConn, metadata); err != nil {
+		host, err := sd.sniffDomain(conn, metadata)
+		if err != nil {
 			sd.cacheSniffFailed(metadata)
-			log.Debugln("[Sniffer] All sniffing sniff failed with from [%s:%s] to [%s:%s]", metadata.SrcIP, metadata.SrcPort, metadata.String(), metadata.DstPort)
-			return
-		} else {
-			if sd.skipSNI.Search(host) != nil {
-				log.Debugln("[Sniffer] Skip sni[%s]", host)
-				return
-			}
-
-			sd.rwMux.RLock()
-			sd.skipList.Delete(dst)
-			sd.rwMux.RUnlock()
-
-			sd.replaceDomain(metadata, host, overrideDest)
+			log.Debugln("[Sniffer] All sniffing sniff failed with from [%s:%d] to [%s:%d]", metadata.SrcIP, metadata.SrcPort, metadata.String(), metadata.DstPort)
+			return false
 		}
+
+		for _, matcher := range sd.skipDomain {
+			if matcher.MatchDomain(host) {
+				log.Debugln("[Sniffer] Skip sni[%s]", host)
+				return false
+			}
+		}
+
+		sd.skipList.Delete(dst)
+
+		sd.replaceDomain(metadata, host, overrideDest)
+		return true
 	}
+	return false
 }
 
-func (sd *SnifferDispatcher) replaceDomain(metadata *C.Metadata, host string, overrideDest bool) {
+func (sd *Dispatcher) replaceDomain(metadata *C.Metadata, host string, overrideDest bool) {
 	metadata.SniffHost = host
 	if overrideDest {
+		log.Debugln("[Sniffer] Sniff %s [%s]-->[%s] success, replace domain [%s]-->[%s]",
+			metadata.NetWork,
+			metadata.SourceDetail(),
+			metadata.RemoteAddress(),
+			metadata.Host, host)
 		metadata.Host = host
 	}
 	metadata.DNSMode = C.DNSNormal
-	log.Debugln("[Sniffer] Sniff TCP [%s]-->[%s] success, replace domain [%s]-->[%s]",
-		metadata.SourceDetail(),
-		metadata.RemoteAddress(),
-		metadata.Host, host)
 }
 
-func (sd *SnifferDispatcher) Enable() bool {
-	return sd.enable
+func (sd *Dispatcher) Enable() bool {
+	return sd != nil && sd.enable
 }
 
-func (sd *SnifferDispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metadata) (string, error) {
+func (sd *Dispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metadata) (string, error) {
+	//defer func(start time.Time) {
+	//	log.Debugln("[Sniffer] [%s] Sniffing took %s", metadata.DstIP, time.Since(start))
+	//}(time.Now())
+
 	for s := range sd.sniffers {
-		if s.SupportNetwork() == C.TCP {
+		if s.SupportNetwork() == C.TCP && s.SupportPort(metadata.DstPort) {
 			_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 			_, err := conn.Peek(1)
 			_ = conn.SetReadDeadline(time.Time{})
@@ -119,7 +158,7 @@ func (sd *SnifferDispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metad
 				_, ok := err.(*net.OpError)
 				if ok {
 					sd.cacheSniffFailed(metadata)
-					log.Errorln("[Sniffer] [%s] may not have any sent data, Consider adding skip", metadata.DstIP.String())
+					log.Errorln("[Sniffer] [%s] [%s] may not have any sent data, Consider adding skip", metadata.DstIP, s.Protocol())
 					_ = conn.Close()
 				}
 
@@ -129,22 +168,36 @@ func (sd *SnifferDispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metad
 			bufferedLen := conn.Buffered()
 			bytes, err := conn.Peek(bufferedLen)
 			if err != nil {
-				log.Debugln("[Sniffer] the data length not enough")
+				log.Debugln("[Sniffer] [%s] [%s] the data length not enough, error: %v", metadata.DstIP, s.Protocol(), err)
 				continue
 			}
 
-			host, err := s.SniffTCP(bytes)
+			host, err := s.SniffData(bytes)
+			var e *errNeedAtLeastData
+			if errors.As(err, &e) {
+				//log.Debugln("[Sniffer] [%s] [%s] %v, got length: %d", metadata.DstIP, s.Protocol(), e, len(bytes))
+				_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+				bytes, err = conn.Peek(e.length)
+				_ = conn.SetReadDeadline(time.Time{})
+				//log.Debugln("[Sniffer] [%s] [%s] try again, got length: %d", metadata.DstIP, s.Protocol(), len(bytes))
+				if err != nil {
+					log.Debugln("[Sniffer] [%s] [%s] the data length not enough, error: %v", metadata.DstIP, s.Protocol(), err)
+					continue
+				}
+				host, err = s.SniffData(bytes)
+			}
 			if err != nil {
-				//log.Debugln("[Sniffer] [%s] Sniff data failed %s", s.Protocol(), metadata.DstIP)
+				//log.Debugln("[Sniffer] [%s] [%s] Sniff data failed, error: %v", metadata.DstIP, s.Protocol(), err)
 				continue
 			}
 
 			_, err = netip.ParseAddr(host)
 			if err == nil {
-				//log.Debugln("[Sniffer] [%s] Sniff data failed %s", s.Protocol(), metadata.DstIP)
+				//log.Debugln("[Sniffer] [%s] [%s] Sniff data failed, got host [%s]", metadata.DstIP, s.Protocol(), host)
 				continue
 			}
 
+			//log.Debugln("[Sniffer] [%s] [%s] Sniffed [%s]", metadata.DstIP, s.Protocol(), host)
 			return host, nil
 		}
 	}
@@ -152,43 +205,45 @@ func (sd *SnifferDispatcher) sniffDomain(conn *N.BufferedConn, metadata *C.Metad
 	return "", ErrorSniffFailed
 }
 
-func (sd *SnifferDispatcher) cacheSniffFailed(metadata *C.Metadata) {
-	sd.rwMux.Lock()
-	dst := fmt.Sprintf("%s:%s", metadata.DstIP, metadata.DstPort)
-	count, _ := sd.skipList.Get(dst)
-	if count <= 5 {
-		count++
-	}
-	sd.skipList.Set(dst, count)
-	sd.rwMux.Unlock()
+func (sd *Dispatcher) cacheSniffFailed(metadata *C.Metadata) {
+	dst := metadata.AddrPort()
+	sd.skipList.Compute(dst, func(oldValue uint8, loaded bool) (newValue uint8, delete bool) {
+		if oldValue <= 5 {
+			oldValue++
+		}
+		return oldValue, false
+	})
 }
 
-func NewCloseSnifferDispatcher() (*SnifferDispatcher, error) {
-	dispatcher := SnifferDispatcher{
-		enable: false,
-	}
-
-	return &dispatcher, nil
+type Config struct {
+	Enable          bool
+	Sniffers        map[sniffer.Type]SnifferConfig
+	ForceDomain     []C.DomainMatcher
+	SkipSrcAddress  []C.IpMatcher
+	SkipDstAddress  []C.IpMatcher
+	SkipDomain      []C.DomainMatcher
+	ForceDnsMapping bool
+	ParsePureIp     bool
 }
 
-func NewSnifferDispatcher(snifferConfig map[sniffer.Type]SnifferConfig, forceDomain *trie.DomainTrie[struct{}],
-	skipSNI *trie.DomainTrie[struct{}],
-	forceDnsMapping bool, parsePureIp bool) (*SnifferDispatcher, error) {
-	dispatcher := SnifferDispatcher{
-		enable:          true,
-		forceDomain:     forceDomain,
-		skipSNI:         skipSNI,
-		skipList:        cache.New(cache.WithSize[string, uint8](128), cache.WithAge[string, uint8](600)),
-		forceDnsMapping: forceDnsMapping,
-		parsePureIp:     parsePureIp,
-		sniffers:        make(map[sniffer.Sniffer]SnifferConfig, 0),
+func NewDispatcher(snifferConfig *Config) (*Dispatcher, error) {
+	dispatcher := Dispatcher{
+		enable:          snifferConfig.Enable,
+		forceDomain:     snifferConfig.ForceDomain,
+		skipSrcAddress:  snifferConfig.SkipSrcAddress,
+		skipDstAddress:  snifferConfig.SkipDstAddress,
+		skipDomain:      snifferConfig.SkipDomain,
+		skipList:        lru.New(lru.WithSize[netip.AddrPort, uint8](128), lru.WithAge[netip.AddrPort, uint8](600)),
+		forceDnsMapping: snifferConfig.ForceDnsMapping,
+		parsePureIp:     snifferConfig.ParsePureIp,
+		sniffers:        make(map[sniffer.Sniffer]SnifferConfig, len(snifferConfig.Sniffers)),
 	}
 
-	for snifferName, config := range snifferConfig {
+	for snifferName, config := range snifferConfig.Sniffers {
 		s, err := NewSniffer(snifferName, config)
 		if err != nil {
 			log.Errorln("Sniffer name[%s] is error", snifferName)
-			return &SnifferDispatcher{enable: false}, err
+			return &Dispatcher{enable: false}, err
 		}
 		dispatcher.sniffers[s] = config
 	}
@@ -202,6 +257,8 @@ func NewSniffer(name sniffer.Type, snifferConfig SnifferConfig) (sniffer.Sniffer
 		return NewTLSSniffer(snifferConfig)
 	case sniffer.HTTP:
 		return NewHTTPSniffer(snifferConfig)
+	case sniffer.QUIC:
+		return NewQuicSniffer(snifferConfig)
 	default:
 		return nil, ErrorUnsupportedSniffer
 	}

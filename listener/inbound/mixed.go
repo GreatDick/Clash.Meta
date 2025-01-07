@@ -3,16 +3,17 @@ package inbound
 import (
 	"fmt"
 
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/log"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 
-	"github.com/Dreamacro/clash/listener/mixed"
-	"github.com/Dreamacro/clash/listener/socks"
+	"github.com/metacubex/mihomo/listener/mixed"
+	"github.com/metacubex/mihomo/listener/socks"
 )
 
 type MixedOption struct {
 	BaseOption
-	UDP bool `inbound:"udp,omitempty"`
+	Users AuthUsers `inbound:"users,omitempty"`
+	UDP   bool      `inbound:"udp,omitempty"`
 }
 
 func (o MixedOption) Equal(config C.InboundConfig) bool {
@@ -50,14 +51,14 @@ func (m *Mixed) Address() string {
 }
 
 // Listen implements constant.InboundListener
-func (m *Mixed) Listen(tcpIn chan<- C.ConnContext, udpIn chan<- C.PacketAdapter, natTable C.NatTable) error {
+func (m *Mixed) Listen(tunnel C.Tunnel) error {
 	var err error
-	m.l, err = mixed.New(m.RawAddress(), tcpIn, m.Additions()...)
+	m.l, err = mixed.NewWithAuthenticator(m.RawAddress(), tunnel, m.config.Users.GetAuthStore(), m.Additions()...)
 	if err != nil {
 		return err
 	}
 	if m.udp {
-		m.lUDP, err = socks.NewUDP(m.RawAddress(), udpIn, m.Additions()...)
+		m.lUDP, err = socks.NewUDP(m.RawAddress(), tunnel, m.Additions()...)
 		if err != nil {
 			return err
 		}

@@ -3,6 +3,7 @@ package structure
 // references: https://github.com/mitchellh/mapstructure
 
 import (
+	"encoding"
 	"encoding/base64"
 	"fmt"
 	"reflect"
@@ -85,31 +86,62 @@ func (d *Decoder) Decode(src map[string]any, dst any) error {
 	return nil
 }
 
-func (d *Decoder) decode(name string, data any, val reflect.Value) error {
-	kind := val.Kind()
-	switch {
-	case isInt(kind):
-		return d.decodeInt(name, data, val)
-	case isUint(kind):
-		return d.decodeUint(name, data, val)
-	case isFloat(kind):
-		return d.decodeFloat(name, data, val)
+// isNil returns true if the input is nil or a typed nil pointer.
+func isNil(input any) bool {
+	if input == nil {
+		return true
 	}
-	switch kind {
-	case reflect.String:
-		return d.decodeString(name, data, val)
-	case reflect.Bool:
-		return d.decodeBool(name, data, val)
-	case reflect.Slice:
-		return d.decodeSlice(name, data, val)
-	case reflect.Map:
-		return d.decodeMap(name, data, val)
-	case reflect.Interface:
-		return d.setInterface(name, data, val)
-	case reflect.Struct:
-		return d.decodeStruct(name, data, val)
-	default:
-		return fmt.Errorf("type %s not support", val.Kind().String())
+	val := reflect.ValueOf(input)
+	return val.Kind() == reflect.Pointer && val.IsNil()
+}
+
+func (d *Decoder) decode(name string, data any, val reflect.Value) error {
+	if isNil(data) {
+		// If the data is nil, then we don't set anything
+		// Maybe we should set to zero value?
+		return nil
+	}
+	if !reflect.ValueOf(data).IsValid() {
+		// If the input value is invalid, then we just set the value
+		// to be the zero value.
+		val.Set(reflect.Zero(val.Type()))
+		return nil
+	}
+	for {
+		kind := val.Kind()
+		if kind == reflect.Pointer && val.IsNil() {
+			val.Set(reflect.New(val.Type().Elem()))
+		}
+		if ok, err := d.decodeTextUnmarshaller(name, data, val); ok {
+			return err
+		}
+		switch {
+		case isInt(kind):
+			return d.decodeInt(name, data, val)
+		case isUint(kind):
+			return d.decodeUint(name, data, val)
+		case isFloat(kind):
+			return d.decodeFloat(name, data, val)
+		}
+		switch kind {
+		case reflect.Pointer:
+			val = val.Elem()
+			continue
+		case reflect.String:
+			return d.decodeString(name, data, val)
+		case reflect.Bool:
+			return d.decodeBool(name, data, val)
+		case reflect.Slice:
+			return d.decodeSlice(name, data, val)
+		case reflect.Map:
+			return d.decodeMap(name, data, val)
+		case reflect.Interface:
+			return d.setInterface(name, data, val)
+		case reflect.Struct:
+			return d.decodeStruct(name, data, val)
+		default:
+			return fmt.Errorf("type %s not support", val.Kind().String())
+		}
 	}
 }
 
@@ -282,6 +314,9 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 	}
 
 	valSlice := val
+	// make a new slice with cap(val)==cap(dataVal)
+	// the caller can determine whether the original configuration contains this item by judging whether the value is nil.
+	valSlice = reflect.MakeSlice(valType, 0, dataVal.Len())
 	for i := 0; i < dataVal.Len(); i++ {
 		currentData := dataVal.Index(i).Interface()
 		for valSlice.Len() <= i {
@@ -544,4 +579,26 @@ func (d *Decoder) setInterface(name string, data any, val reflect.Value) (err er
 	dataVal := reflect.ValueOf(data)
 	val.Set(dataVal)
 	return nil
+}
+
+func (d *Decoder) decodeTextUnmarshaller(name string, data any, val reflect.Value) (bool, error) {
+	if !val.CanAddr() {
+		return false, nil
+	}
+	valAddr := val.Addr()
+	if !valAddr.CanInterface() {
+		return false, nil
+	}
+	unmarshaller, ok := valAddr.Interface().(encoding.TextUnmarshaler)
+	if !ok {
+		return false, nil
+	}
+	var str string
+	if err := d.decodeString(name, data, reflect.Indirect(reflect.ValueOf(&str))); err != nil {
+		return false, err
+	}
+	if err := unmarshaller.UnmarshalText([]byte(str)); err != nil {
+		return true, fmt.Errorf("cannot parse '%s' as %s: %s", name, val.Type(), err)
+	}
+	return true, nil
 }

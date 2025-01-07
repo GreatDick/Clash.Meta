@@ -4,21 +4,18 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/metacubex/quic-go"
 
-	"github.com/Dreamacro/clash/transport/hysteria/conns/faketcp"
-	"github.com/Dreamacro/clash/transport/hysteria/conns/udp"
-	"github.com/Dreamacro/clash/transport/hysteria/conns/wechat"
-	obfsPkg "github.com/Dreamacro/clash/transport/hysteria/obfs"
-	"github.com/Dreamacro/clash/transport/hysteria/utils"
+	"github.com/metacubex/mihomo/transport/hysteria/conns/faketcp"
+	"github.com/metacubex/mihomo/transport/hysteria/conns/udp"
+	"github.com/metacubex/mihomo/transport/hysteria/conns/wechat"
+	obfsPkg "github.com/metacubex/mihomo/transport/hysteria/obfs"
+	"github.com/metacubex/mihomo/transport/hysteria/utils"
 )
 
-type ClientTransport struct {
-	Dialer *net.Dialer
-}
+type ClientTransport struct{}
 
 func (ct *ClientTransport) quicPacketConn(proto string, rAddr net.Addr, serverPorts string, obfs obfsPkg.Obfuscator, hopInterval time.Duration, dialer utils.PacketDialer) (net.PacketConn, error) {
 	server := rAddr.String()
@@ -76,30 +73,13 @@ func (ct *ClientTransport) QUICDial(proto string, server string, serverPorts str
 		return nil, err
 	}
 
-	qs, err := quic.DialContext(dialer.Context(), pktConn, serverUDPAddr, server, tlsConfig, quicConfig)
+	transport := quic.Transport{Conn: pktConn}
+	transport.SetCreatedConn(true) // auto close conn
+	transport.SetSingleUse(true)   // auto close transport
+	qs, err := transport.Dial(dialer.Context(), serverUDPAddr, tlsConfig, quicConfig)
 	if err != nil {
 		_ = pktConn.Close()
 		return nil, err
 	}
 	return qs, nil
-}
-
-func (ct *ClientTransport) DialTCP(raddr *net.TCPAddr) (*net.TCPConn, error) {
-	conn, err := ct.Dialer.Dial("tcp", raddr.String())
-	if err != nil {
-		return nil, err
-	}
-	return conn.(*net.TCPConn), nil
-}
-
-func (ct *ClientTransport) ListenUDP() (*net.UDPConn, error) {
-	return net.ListenUDP("udp", nil)
-}
-
-func isMultiPortAddr(addr string) bool {
-	_, portStr, err := net.SplitHostPort(addr)
-	if err == nil && (strings.Contains(portStr, ",") || strings.Contains(portStr, "-")) {
-		return true
-	}
-	return false
 }

@@ -3,8 +3,9 @@ package redir
 import (
 	"net"
 
-	"github.com/Dreamacro/clash/adapter/inbound"
-	C "github.com/Dreamacro/clash/constant"
+	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/component/keepalive"
+	C "github.com/metacubex/mihomo/constant"
 )
 
 type Listener struct {
@@ -29,17 +30,19 @@ func (l *Listener) Close() error {
 	return l.listener.Close()
 }
 
-func New(addr string, in chan<- C.ConnContext, additions ...inbound.Addition) (*Listener, error) {
+func New(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
 	if len(additions) == 0 {
 		additions = []inbound.Addition{
 			inbound.WithInName("DEFAULT-REDIR"),
 			inbound.WithSpecialRules(""),
 		}
 	}
+
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+
 	rl := &Listener{
 		listener: l,
 		addr:     addr,
@@ -54,18 +57,19 @@ func New(addr string, in chan<- C.ConnContext, additions ...inbound.Addition) (*
 				}
 				continue
 			}
-			go handleRedir(c, in, additions...)
+			go handleRedir(c, tunnel, additions...)
 		}
 	}()
 
 	return rl, nil
 }
-func handleRedir(conn net.Conn, in chan<- C.ConnContext, additions ...inbound.Addition) {
+
+func handleRedir(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) {
 	target, err := parserPacket(conn)
 	if err != nil {
 		conn.Close()
 		return
 	}
-	conn.(*net.TCPConn).SetKeepAlive(true)
-	in <- inbound.NewSocket(target, conn, C.REDIR, additions...)
+	keepalive.TCPKeepAlive(conn)
+	tunnel.HandleTCPConn(inbound.NewSocket(target, conn, C.REDIR, additions...))
 }

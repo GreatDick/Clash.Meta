@@ -4,30 +4,22 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	xtls "github.com/xtls/go"
+	"fmt"
 	"net"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"sync"
-	"time"
 
-	"github.com/Dreamacro/clash/component/resolver"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/transport/socks5"
+	"github.com/metacubex/mihomo/component/resolver"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/socks5"
 )
 
 var (
-	globalClientSessionCache  tls.ClientSessionCache
-	globalClientXSessionCache xtls.ClientSessionCache
-	once                      sync.Once
+	globalClientSessionCache tls.ClientSessionCache
+	once                     sync.Once
 )
-
-func tcpKeepAlive(c net.Conn) {
-	if tcp, ok := c.(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-	}
-}
 
 func getClientSessionCache() tls.ClientSessionCache {
 	once.Do(func() {
@@ -36,18 +28,11 @@ func getClientSessionCache() tls.ClientSessionCache {
 	return globalClientSessionCache
 }
 
-func getClientXSessionCache() xtls.ClientSessionCache {
-	once.Do(func() {
-		globalClientXSessionCache = xtls.NewLRUClientSessionCache(128)
-	})
-	return globalClientXSessionCache
-}
-
 func serializesSocksAddr(metadata *C.Metadata) []byte {
 	var buf [][]byte
 	addrType := metadata.AddrType()
 	aType := uint8(addrType)
-	p, _ := strconv.ParseUint(metadata.DstPort, 10, 16)
+	p := uint(metadata.DstPort)
 	port := []byte{uint8(p >> 8), uint8(p & 0xff)}
 	switch addrType {
 	case socks5.AtypDomainName:
@@ -70,7 +55,7 @@ func resolveUDPAddr(ctx context.Context, network, address string) (*net.UDPAddr,
 		return nil, err
 	}
 
-	ip, err := resolver.ResolveProxyServerHost(ctx, host)
+	ip, err := resolver.ResolveIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
 	if err != nil {
 		return nil, err
 	}
@@ -86,12 +71,12 @@ func resolveUDPAddrWithPrefer(ctx context.Context, network, address string, pref
 	var fallback netip.Addr
 	switch prefer {
 	case C.IPv4Only:
-		ip, err = resolver.ResolveIPv4ProxyServerHost(ctx, host)
+		ip, err = resolver.ResolveIPv4WithResolver(ctx, host, resolver.ProxyServerHostResolver)
 	case C.IPv6Only:
-		ip, err = resolver.ResolveIPv6ProxyServerHost(ctx, host)
+		ip, err = resolver.ResolveIPv6WithResolver(ctx, host, resolver.ProxyServerHostResolver)
 	case C.IPv6Prefer:
 		var ips []netip.Addr
-		ips, err = resolver.LookupIPProxyServerHost(ctx, host)
+		ips, err = resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
 		if err == nil {
 			for _, addr := range ips {
 				if addr.Is6() {
@@ -107,7 +92,7 @@ func resolveUDPAddrWithPrefer(ctx context.Context, network, address string, pref
 	default:
 		// C.IPv4Prefer, C.DualStack and other
 		var ips []netip.Addr
-		ips, err = resolver.LookupIPProxyServerHost(ctx, host)
+		ips, err = resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
 		if err == nil {
 			for _, addr := range ips {
 				if addr.Is4() {
@@ -137,4 +122,43 @@ func safeConnClose(c net.Conn, err error) {
 	if err != nil && c != nil {
 		_ = c.Close()
 	}
+}
+
+var rateStringRegexp = regexp.MustCompile(`^(\d+)\s*([KMGT]?)([Bb])ps$`)
+
+func StringToBps(s string) uint64 {
+	if s == "" {
+		return 0
+	}
+
+	// when have not unit, use Mbps
+	if v, err := strconv.Atoi(s); err == nil {
+		return StringToBps(fmt.Sprintf("%d Mbps", v))
+	}
+
+	m := rateStringRegexp.FindStringSubmatch(s)
+	if m == nil {
+		return 0
+	}
+	var n uint64 = 1
+	switch m[2] {
+	case "T":
+		n *= 1000
+		fallthrough
+	case "G":
+		n *= 1000
+		fallthrough
+	case "M":
+		n *= 1000
+		fallthrough
+	case "K":
+		n *= 1000
+	}
+	v, _ := strconv.ParseUint(m[1], 10, 64)
+	n *= v
+	if m[3] == "b" {
+		// Bits, need to convert to bytes
+		n /= 8
+	}
+	return n
 }

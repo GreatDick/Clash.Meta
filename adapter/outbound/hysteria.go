@@ -2,16 +2,12 @@ package outbound
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
-	"regexp"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -19,15 +15,18 @@ import (
 	"github.com/metacubex/quic-go/congestion"
 	M "github.com/sagernet/sing/common/metadata"
 
-	"github.com/Dreamacro/clash/component/dialer"
-	tlsC "github.com/Dreamacro/clash/component/tls"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/log"
-	hyCongestion "github.com/Dreamacro/clash/transport/hysteria/congestion"
-	"github.com/Dreamacro/clash/transport/hysteria/core"
-	"github.com/Dreamacro/clash/transport/hysteria/obfs"
-	"github.com/Dreamacro/clash/transport/hysteria/pmtud_fix"
-	"github.com/Dreamacro/clash/transport/hysteria/transport"
+	CN "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/proxydialer"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
+	hyCongestion "github.com/metacubex/mihomo/transport/hysteria/congestion"
+	"github.com/metacubex/mihomo/transport/hysteria/core"
+	"github.com/metacubex/mihomo/transport/hysteria/obfs"
+	"github.com/metacubex/mihomo/transport/hysteria/pmtud_fix"
+	"github.com/metacubex/mihomo/transport/hysteria/transport"
+	"github.com/metacubex/mihomo/transport/hysteria/utils"
 )
 
 const (
@@ -41,48 +40,58 @@ const (
 	DefaultHopInterval = 10
 )
 
-var rateStringRegexp = regexp.MustCompile(`^(\d+)\s*([KMGT]?)([Bb])ps$`)
-
 type Hysteria struct {
 	*Base
 
+	option *HysteriaOption
 	client *core.Client
+
+	closeCh chan struct{} // for test
 }
 
 func (h *Hysteria) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.Conn, error) {
-	hdc := hyDialerWithContext{
-		ctx: context.Background(),
-		hyDialer: func(network string) (net.PacketConn, error) {
-			return dialer.ListenPacket(ctx, network, "", h.Base.DialOptions(opts...)...)
-		},
-		remoteAddr: func(addr string) (net.Addr, error) {
-			return resolveUDPAddrWithPrefer(ctx, "udp", addr, h.prefer)
-		},
-	}
-
-	tcpConn, err := h.client.DialTCP(metadata.RemoteAddress(), &hdc)
+	tcpConn, err := h.client.DialTCP(metadata.String(), metadata.DstPort, h.genHdc(ctx, opts...))
 	if err != nil {
 		return nil, err
 	}
 
-	return NewConn(tcpConn, h), nil
+	return NewConn(CN.NewRefConn(tcpConn, h), h), nil
 }
 
 func (h *Hysteria) ListenPacketContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.PacketConn, error) {
-	hdc := hyDialerWithContext{
+	udpConn, err := h.client.DialUDP(h.genHdc(ctx, opts...))
+	if err != nil {
+		return nil, err
+	}
+	return newPacketConn(CN.NewRefPacketConn(&hyPacketConn{udpConn}, h), h), nil
+}
+
+func (h *Hysteria) genHdc(ctx context.Context, opts ...dialer.Option) utils.PacketDialer {
+	return &hyDialerWithContext{
 		ctx: context.Background(),
-		hyDialer: func(network string) (net.PacketConn, error) {
-			return dialer.ListenPacket(ctx, network, "", h.Base.DialOptions(opts...)...)
+		hyDialer: func(network string, rAddr net.Addr) (net.PacketConn, error) {
+			var err error
+			var cDialer C.Dialer = dialer.NewDialer(h.Base.DialOptions(opts...)...)
+			if len(h.option.DialerProxy) > 0 {
+				cDialer, err = proxydialer.NewByName(h.option.DialerProxy, cDialer)
+				if err != nil {
+					return nil, err
+				}
+			}
+			rAddrPort, _ := netip.ParseAddrPort(rAddr.String())
+			return cDialer.ListenPacket(ctx, network, "", rAddrPort)
 		},
 		remoteAddr: func(addr string) (net.Addr, error) {
 			return resolveUDPAddrWithPrefer(ctx, "udp", addr, h.prefer)
 		},
 	}
-	udpConn, err := h.client.DialUDP(&hdc)
-	if err != nil {
-		return nil, err
-	}
-	return newPacketConn(&hyPacketConn{udpConn}, h), nil
+}
+
+// ProxyInfo implements C.ProxyAdapter
+func (h *Hysteria) ProxyInfo() C.ProxyInfo {
+	info := h.Base.ProxyInfo()
+	info.DialerProxy = h.option.DialerProxy
+	return info
 }
 
 type HysteriaOption struct {
@@ -115,12 +124,12 @@ type HysteriaOption struct {
 
 func (c *HysteriaOption) Speed() (uint64, uint64, error) {
 	var up, down uint64
-	up = stringToBps(c.Up)
+	up = StringToBps(c.Up)
 	if up == 0 {
 		return 0, 0, fmt.Errorf("invaild upload speed: %s", c.Up)
 	}
 
-	down = stringToBps(c.Down)
+	down = StringToBps(c.Down)
 	if down == 0 {
 		return 0, 0, fmt.Errorf("invaild download speed: %s", c.Down)
 	}
@@ -129,11 +138,7 @@ func (c *HysteriaOption) Speed() (uint64, uint64, error) {
 }
 
 func NewHysteria(option HysteriaOption) (*Hysteria, error) {
-	clientTransport := &transport.ClientTransport{
-		Dialer: &net.Dialer{
-			Timeout: 8 * time.Second,
-		},
-	}
+	clientTransport := &transport.ClientTransport{}
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
 	ports := option.Ports
 
@@ -148,37 +153,10 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 		MinVersion:         tls.VersionTLS13,
 	}
 
-	var bs []byte
 	var err error
-	if len(option.CustomCA) > 0 {
-		bs, err = os.ReadFile(option.CustomCA)
-		if err != nil {
-			return nil, fmt.Errorf("hysteria %s load ca error: %w", addr, err)
-		}
-	} else if option.CustomCAString != "" {
-		bs = []byte(option.CustomCAString)
-	}
-
-	if len(bs) > 0 {
-		block, _ := pem.Decode(bs)
-		if block == nil {
-			return nil, fmt.Errorf("CA cert is not PEM")
-		}
-
-		fpBytes := sha256.Sum256(block.Bytes)
-		if len(option.Fingerprint) == 0 {
-			option.Fingerprint = hex.EncodeToString(fpBytes[:])
-		}
-	}
-
-	if len(option.Fingerprint) != 0 {
-		var err error
-		tlsConfig, err = tlsC.GetSpecifiedFingerprintTLSConfig(tlsConfig, option.Fingerprint)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		tlsConfig = tlsC.GetGlobalTLSConfig(tlsConfig)
+	tlsConfig, err = ca.GetTLSConfig(tlsConfig, option.Fingerprint, option.CustomCA, option.CustomCAString)
+	if err != nil {
+		return nil, err
 	}
 
 	if len(option.ALPN) > 0 {
@@ -247,7 +225,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hysteria %s create error: %w", addr, err)
 	}
-	return &Hysteria{
+	outbound := &Hysteria{
 		Base: &Base{
 			name:   option.Name,
 			addr:   addr,
@@ -258,44 +236,21 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 			rmark:  option.RoutingMark,
 			prefer: C.NewDNSPrefer(option.IPVersion),
 		},
+		option: &option,
 		client: client,
-	}, nil
+	}
+	runtime.SetFinalizer(outbound, closeHysteria)
+
+	return outbound, nil
 }
 
-func stringToBps(s string) uint64 {
-	if s == "" {
-		return 0
+func closeHysteria(h *Hysteria) {
+	if h.client != nil {
+		_ = h.client.Close()
 	}
-
-	// when have not unit, use Mbps
-	if v, err := strconv.Atoi(s); err == nil {
-		return stringToBps(fmt.Sprintf("%d Mbps", v))
+	if h.closeCh != nil {
+		close(h.closeCh)
 	}
-
-	m := rateStringRegexp.FindStringSubmatch(s)
-	if m == nil {
-		return 0
-	}
-	var n uint64
-	switch m[2] {
-	case "K":
-		n = 1 << 10
-	case "M":
-		n = 1 << 20
-	case "G":
-		n = 1 << 30
-	case "T":
-		n = 1 << 40
-	default:
-		n = 1
-	}
-	v, _ := strconv.ParseUint(m[1], 10, 64)
-	n = v * n
-	if m[3] == "b" {
-		// Bits, need to convert to bytes
-		n = n >> 3
-	}
-	return n
 }
 
 type hyPacketConn struct {
@@ -312,6 +267,16 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	return
 }
 
+func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, err error) {
+	b, addrStr, err := c.UDPConn.ReadFrom()
+	if err != nil {
+		return
+	}
+	data = b
+	addr = M.ParseSocksaddr(addrStr).UDPAddr()
+	return
+}
+
 func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
 	if err != nil {
@@ -322,7 +287,7 @@ func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 }
 
 type hyDialerWithContext struct {
-	hyDialer   func(network string) (net.PacketConn, error)
+	hyDialer   func(network string, rAddr net.Addr) (net.PacketConn, error)
 	ctx        context.Context
 	remoteAddr func(host string) (net.Addr, error)
 }
@@ -332,7 +297,7 @@ func (h *hyDialerWithContext) ListenPacket(rAddr net.Addr) (net.PacketConn, erro
 	if addrPort, err := netip.ParseAddrPort(rAddr.String()); err == nil {
 		network = dialer.ParseNetwork(network, addrPort.Addr())
 	}
-	return h.hyDialer(network)
+	return h.hyDialer(network, rAddr)
 }
 
 func (h *hyDialerWithContext) Context() context.Context {

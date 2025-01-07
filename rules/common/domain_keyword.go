@@ -1,17 +1,16 @@
 package common
 
 import (
-	"golang.org/x/net/idna"
 	"strings"
 
-	C "github.com/Dreamacro/clash/constant"
+	C "github.com/metacubex/mihomo/constant"
+	"golang.org/x/net/idna"
 )
 
 type DomainKeyword struct {
 	*Base
 	keyword string
 	adapter string
-	isIDNA  bool
 }
 
 func (dk *DomainKeyword) RuleType() C.RuleType {
@@ -28,20 +27,15 @@ func (dk *DomainKeyword) Adapter() string {
 }
 
 func (dk *DomainKeyword) Payload() string {
-	keyword := dk.keyword
-	if dk.isIDNA {
-		keyword, _ = idna.ToUnicode(keyword)
-	}
-	return keyword
+	return dk.keyword
 }
 
 func NewDomainKeyword(keyword string, adapter string) *DomainKeyword {
-	actualDomainKeyword, _ := idna.ToASCII(keyword)
+	punycode, _ := idna.ToASCII(strings.ToLower(keyword))
 	return &DomainKeyword{
 		Base:    &Base{},
-		keyword: strings.ToLower(actualDomainKeyword),
+		keyword: punycode,
 		adapter: adapter,
-		isIDNA:  keyword != actualDomainKeyword,
 	}
 }
 

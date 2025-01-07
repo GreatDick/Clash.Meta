@@ -1,4 +1,4 @@
-NAME=clash.meta
+NAME=mihomo
 BINDIR=bin
 BRANCH=$(shell git branch --show-current)
 ifeq ($(BRANCH),Alpha)
@@ -12,11 +12,12 @@ VERSION=$(shell git rev-parse --short HEAD)
 endif
 
 BUILDTIME=$(shell date -u)
-GOBUILD=CGO_ENABLED=0 go build -tags with_gvisor -trimpath -ldflags '-X "github.com/Dreamacro/clash/constant.Version=$(VERSION)" \
-		-X "github.com/Dreamacro/clash/constant.BuildTime=$(BUILDTIME)" \
+GOBUILD=CGO_ENABLED=0 go build -tags with_gvisor -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=$(VERSION)" \
+		-X "github.com/metacubex/mihomo/constant.BuildTime=$(BUILDTIME)" \
 		-w -s -buildid='
 
 PLATFORM_LIST = \
+	darwin-amd64-compatible \
 	darwin-amd64 \
 	darwin-arm64 \
 	linux-amd64-compatible \
@@ -31,6 +32,8 @@ PLATFORM_LIST = \
 	linux-mips-hardfloat \
 	linux-mipsle-softfloat \
 	linux-mipsle-hardfloat \
+	linux-riscv64 \
+	linux-loong64 \
 	android-arm64 \
 	freebsd-386 \
 	freebsd-amd64 \
@@ -101,6 +104,12 @@ linux-mips64:
 linux-mips64le:
 	GOARCH=mips64le GOOS=linux $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
 
+linux-riscv64:
+	GOARCH=riscv64 GOOS=linux $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
+	
+linux-loong64:
+	GOARCH=loong64 GOOS=linux $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
+
 android-arm64:
 	GOARCH=arm64 GOOS=android $(GOBUILD) -o $(BINDIR)/$(NAME)-$@
 
@@ -154,7 +163,3 @@ clean:
 CLANG ?= clang-14
 CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
 
-ebpf: export BPF_CLANG := $(CLANG)
-ebpf: export BPF_CFLAGS := $(CFLAGS)
-ebpf:
-	cd component/ebpf/ && go generate ./...

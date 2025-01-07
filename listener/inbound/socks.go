@@ -2,14 +2,15 @@ package inbound
 
 import (
 	"fmt"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/listener/socks"
-	"github.com/Dreamacro/clash/log"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/listener/socks"
+	"github.com/metacubex/mihomo/log"
 )
 
 type SocksOption struct {
 	BaseOption
-	UDP bool `inbound:"udp,omitempty"`
+	Users AuthUsers `inbound:"users,omitempty"`
+	UDP   bool      `inbound:"udp,omitempty"`
 }
 
 func (o SocksOption) Equal(config C.InboundConfig) bool {
@@ -68,13 +69,13 @@ func (s *Socks) Address() string {
 }
 
 // Listen implements constant.InboundListener
-func (s *Socks) Listen(tcpIn chan<- C.ConnContext, udpIn chan<- C.PacketAdapter, natTable C.NatTable) error {
+func (s *Socks) Listen(tunnel C.Tunnel) error {
 	var err error
-	if s.stl, err = socks.New(s.RawAddress(), tcpIn, s.Additions()...); err != nil {
+	if s.stl, err = socks.NewWithAuthenticator(s.RawAddress(), tunnel, s.config.Users.GetAuthStore(), s.Additions()...); err != nil {
 		return err
 	}
 	if s.udp {
-		if s.sul, err = socks.NewUDP(s.RawAddress(), udpIn, s.Additions()...); err != nil {
+		if s.sul, err = socks.NewUDP(s.RawAddress(), tunnel, s.Additions()...); err != nil {
 			return err
 		}
 	}

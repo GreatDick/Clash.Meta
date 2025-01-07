@@ -2,21 +2,37 @@ package http
 
 import (
 	"context"
-	"github.com/Dreamacro/clash/component/tls"
-	"github.com/Dreamacro/clash/listener/inner"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
 	URL "net/url"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/listener/inner"
 )
 
-const (
-	UA = "clash.meta"
+var (
+	ua string
 )
+
+func UA() string {
+	return ua
+}
+
+func SetUA(UA string) {
+	ua = UA
+}
 
 func HttpRequest(ctx context.Context, url, method string, header map[string][]string, body io.Reader) (*http.Response, error) {
+	return HttpRequestWithProxy(ctx, url, method, header, body, "")
+}
+
+func HttpRequestWithProxy(ctx context.Context, url, method string, header map[string][]string, body io.Reader, specialProxy string) (*http.Response, error) {
 	method = strings.ToUpper(method)
 	urlRes, err := URL.Parse(url)
 	if err != nil {
@@ -31,7 +47,7 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 	}
 
 	if _, ok := header["User-Agent"]; !ok {
-		req.Header.Set("User-Agent", UA)
+		req.Header.Set("User-Agent", UA())
 	}
 
 	if err != nil {
@@ -47,18 +63,21 @@ func HttpRequest(ctx context.Context, url, method string, header map[string][]st
 
 	transport := &http.Transport{
 		// from http.DefaultTransport
+		DisableKeepAlives:     runtime.GOOS == "android",
 		MaxIdleConns:          100,
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn := inner.HandleTcp(address, urlRes.Hostname())
-			return conn, nil
+			if conn, err := inner.HandleTcp(address, specialProxy); err == nil {
+				return conn, nil
+			} else {
+				return dialer.DialContext(ctx, network, address)
+			}
 		},
-		TLSClientConfig: tls.GetDefaultTLSConfig(),
+		TLSClientConfig: ca.GetGlobalTLSConfig(&tls.Config{}),
 	}
 
 	client := http.Client{Transport: transport}
 	return client.Do(req)
-
 }

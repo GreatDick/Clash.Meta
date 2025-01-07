@@ -2,40 +2,55 @@ package tunnel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"path/filepath"
 	"runtime"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/jpillora/backoff"
+	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/loopback"
+	"github.com/metacubex/mihomo/component/nat"
+	P "github.com/metacubex/mihomo/component/process"
+	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/slowdown"
+	"github.com/metacubex/mihomo/component/sniffer"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
+	"github.com/metacubex/mihomo/constant/provider"
+	icontext "github.com/metacubex/mihomo/context"
+	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel/statistic"
+)
 
-	"github.com/Dreamacro/clash/component/nat"
-	P "github.com/Dreamacro/clash/component/process"
-	"github.com/Dreamacro/clash/component/resolver"
-	"github.com/Dreamacro/clash/component/sniffer"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/constant/provider"
-	icontext "github.com/Dreamacro/clash/context"
-	"github.com/Dreamacro/clash/log"
-	"github.com/Dreamacro/clash/tunnel/statistic"
+const (
+	queueCapacity  = 64  // chan capacity tcpQueue and udpQueue
+	senderCapacity = 128 // chan capacity of PacketSender
 )
 
 var (
-	tcpQueue       = make(chan C.ConnContext, 200)
-	udpQueue       = make(chan C.PacketAdapter, 200)
-	natTable       = nat.New()
-	rules          []C.Rule
-	listeners      = make(map[string]C.InboundListener)
-	subRules       map[string][]C.Rule
-	proxies        = make(map[string]C.Proxy)
-	providers      map[string]provider.ProxyProvider
-	ruleProviders  map[string]provider.RuleProvider
-	sniffingEnable = false
-	configMux      sync.RWMutex
+	status        = newAtomicStatus(Suspend)
+	udpInit       sync.Once
+	udpQueues     []chan C.PacketAdapter
+	natTable      = nat.New()
+	rules         []C.Rule
+	listeners     = make(map[string]C.InboundListener)
+	subRules      map[string][]C.Rule
+	proxies       = make(map[string]C.Proxy)
+	providers     map[string]provider.ProxyProvider
+	ruleProviders map[string]provider.RuleProvider
+	configMux     sync.RWMutex
+
+	// for compatibility, lazy init
+	tcpQueue  chan C.ConnContext
+	tcpInOnce sync.Once
+	udpQueue  chan C.PacketAdapter
+	udpInOnce sync.Once
 
 	// Outbound Rule
 	mode = Rule
@@ -46,7 +61,85 @@ var (
 	findProcessMode P.FindProcessMode
 
 	fakeIPRange netip.Prefix
+
+	snifferDispatcher *sniffer.Dispatcher
+	sniffingEnable    = false
+
+	ruleUpdateCallback = utils.NewCallback[provider.RuleProvider]()
 )
+
+type tunnel struct{}
+
+var Tunnel = tunnel{}
+var _ C.Tunnel = Tunnel
+var _ provider.Tunnel = Tunnel
+
+func (t tunnel) HandleTCPConn(conn net.Conn, metadata *C.Metadata) {
+	connCtx := icontext.NewConnContext(conn, metadata)
+	handleTCPConn(connCtx)
+}
+
+func initUDP() {
+	numUDPWorkers := 4
+	if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
+		numUDPWorkers = num
+	}
+
+	udpQueues = make([]chan C.PacketAdapter, numUDPWorkers)
+	for i := 0; i < numUDPWorkers; i++ {
+		queue := make(chan C.PacketAdapter, queueCapacity)
+		udpQueues[i] = queue
+		go processUDP(queue)
+	}
+}
+
+func (t tunnel) HandleUDPPacket(packet C.UDPPacket, metadata *C.Metadata) {
+	udpInit.Do(initUDP)
+
+	packetAdapter := C.NewPacketAdapter(packet, metadata)
+	key := packetAdapter.Key()
+
+	hash := utils.MapHash(key)
+	queueNo := uint(hash) % uint(len(udpQueues))
+
+	select {
+	case udpQueues[queueNo] <- packetAdapter:
+	default:
+		packet.Drop()
+	}
+}
+
+func (t tunnel) NatTable() C.NatTable {
+	return natTable
+}
+
+func (t tunnel) Providers() map[string]provider.ProxyProvider {
+	return providers
+}
+
+func (t tunnel) RuleProviders() map[string]provider.RuleProvider {
+	return ruleProviders
+}
+
+func (t tunnel) RuleUpdateCallback() *utils.Callback[provider.RuleProvider] {
+	return ruleUpdateCallback
+}
+
+func OnSuspend() {
+	status.Store(Suspend)
+}
+
+func OnInnerLoading() {
+	status.Store(Inner)
+}
+
+func OnRunning() {
+	status.Store(Running)
+}
+
+func Status() TunnelStatus {
+	return status.Load()
+}
 
 func SetFakeIPRange(p netip.Prefix) {
 	fakeIPRange = p
@@ -57,7 +150,7 @@ func FakeIPRange() netip.Prefix {
 }
 
 func SetSniffing(b bool) {
-	if sniffer.Dispatcher.Enable() {
+	if snifferDispatcher.Enable() {
 		configMux.Lock()
 		sniffingEnable = b
 		configMux.Unlock()
@@ -68,17 +161,31 @@ func IsSniffing() bool {
 	return sniffingEnable
 }
 
-func init() {
-	go process()
-}
-
 // TCPIn return fan-in queue
+// Deprecated: using Tunnel instead
 func TCPIn() chan<- C.ConnContext {
+	tcpInOnce.Do(func() {
+		tcpQueue = make(chan C.ConnContext, queueCapacity)
+		go func() {
+			for connCtx := range tcpQueue {
+				go handleTCPConn(connCtx)
+			}
+		}()
+	})
 	return tcpQueue
 }
 
 // UDPIn return fan-in udp queue
+// Deprecated: using Tunnel instead
 func UDPIn() chan<- C.PacketAdapter {
+	udpInOnce.Do(func() {
+		udpQueue = make(chan C.PacketAdapter, queueCapacity)
+		go func() {
+			for packet := range udpQueue {
+				Tunnel.HandleUDPPacket(packet, packet.Metadata())
+			}
+		}()
+	})
 	return udpQueue
 }
 
@@ -110,6 +217,20 @@ func Proxies() map[string]C.Proxy {
 	return proxies
 }
 
+func ProxiesWithProviders() map[string]C.Proxy {
+	allProxies := make(map[string]C.Proxy)
+	for name, proxy := range proxies {
+		allProxies[name] = proxy
+	}
+	for _, p := range providers {
+		for _, proxy := range p.Proxies() {
+			name := proxy.Name()
+			allProxies[name] = proxy
+		}
+	}
+	return allProxies
+}
+
 // Providers return all compatible providers
 func Providers() map[string]provider.ProxyProvider {
 	return providers
@@ -134,9 +255,9 @@ func UpdateListeners(newListeners map[string]C.InboundListener) {
 	listeners = newListeners
 }
 
-func UpdateSniffer(dispatcher *sniffer.SnifferDispatcher) {
+func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 	configMux.Lock()
-	sniffer.Dispatcher = dispatcher
+	snifferDispatcher = dispatcher
 	sniffingEnable = dispatcher.Enable()
 	configMux.Unlock()
 }
@@ -151,33 +272,19 @@ func SetMode(m TunnelMode) {
 	mode = m
 }
 
+func FindProcessMode() P.FindProcessMode {
+	return findProcessMode
+}
+
 // SetFindProcessMode replace SetAlwaysFindProcess
 // always find process info if legacyAlways = true or mode.Always() = true, may be increase many memory
 func SetFindProcessMode(mode P.FindProcessMode) {
 	findProcessMode = mode
 }
 
-// processUDP starts a loop to handle udp packet
-func processUDP() {
-	queue := udpQueue
-	for conn := range queue {
-		handleUDPConn(conn)
-	}
-}
-
-func process() {
-	numUDPWorkers := 4
-	if num := runtime.GOMAXPROCS(0); num > numUDPWorkers {
-		numUDPWorkers = num
-	}
-	for i := 0; i < numUDPWorkers; i++ {
-		go processUDP()
-	}
-
-	queue := tcpQueue
-	for conn := range queue {
-		go handleTCPConn(conn)
-	}
+func isHandle(t C.Type) bool {
+	status := status.Load()
+	return status == Running || (status == Inner && t == C.INNER)
 }
 
 func needLookupIP(metadata *C.Metadata) bool {
@@ -200,19 +307,24 @@ func preHandleMetadata(metadata *C.Metadata) error {
 			if resolver.FakeIPEnabled() {
 				metadata.DstIP = netip.Addr{}
 				metadata.DNSMode = C.DNSFakeIP
-			} else if node := resolver.DefaultHosts.Search(host); node != nil {
+			} else if node, ok := resolver.DefaultHosts.Search(host, false); ok {
 				// redir-host should lookup the hosts
-				metadata.DstIP = node.Data()
+				metadata.DstIP, _ = node.RandIP()
+			} else if node != nil && node.IsDomain {
+				metadata.Host = node.Domain
 			}
 		} else if resolver.IsFakeIP(metadata.DstIP) {
 			return fmt.Errorf("fake DNS record %s missing", metadata.DstIP)
 		}
+	} else if node, ok := resolver.DefaultHosts.Search(metadata.Host, true); ok {
+		// try use domain mapping
+		metadata.Host = node.Domain
 	}
 
 	return nil
 }
 
-func resolveMetadata(ctx C.PlainContext, metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
 		proxy, exist = proxies[metadata.SpecialProxy]
@@ -234,9 +346,22 @@ func resolveMetadata(ctx C.PlainContext, metadata *C.Metadata) (proxy C.Proxy, r
 	return
 }
 
+// processUDP starts a loop to handle udp packet
+func processUDP(queue chan C.PacketAdapter) {
+	for conn := range queue {
+		handleUDPConn(conn)
+	}
+}
+
 func handleUDPConn(packet C.PacketAdapter) {
+	if !isHandle(packet.Metadata().Type) {
+		packet.Drop()
+		return
+	}
+
 	metadata := packet.Metadata()
 	if !metadata.Valid() {
+		packet.Drop()
 		log.Warnln("[Metadata] not valid: %#v", metadata)
 		return
 	}
@@ -248,109 +373,75 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 
 	if err := preHandleMetadata(metadata); err != nil {
+		packet.Drop()
 		log.Debugln("[Metadata PreHandle] error: %s", err)
 		return
 	}
 
-	// local resolve UDP dns
-	if !metadata.Resolved() {
-		ip, err := resolver.ResolveIP(context.Background(), metadata.Host)
-		if err != nil {
-			return
-		}
-		metadata.DstIP = ip
+	if sniffingEnable && snifferDispatcher.Enable() {
+		snifferDispatcher.UDPSniff(packet)
 	}
 
-	key := packet.LocalAddr().String()
+	key := packet.Key()
+	sender, loaded := natTable.GetOrCreate(key, newPacketSender)
+	if !loaded {
+		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
+			if err := sender.ResolveUDP(metadata); err != nil {
+				log.Warnln("[UDP] Resolve Ip error: %s", err)
+				return nil, nil, err
+			}
 
-	handle := func() bool {
-		pc := natTable.Get(key)
-		if pc != nil {
-			_ = handleUDPToRemote(packet, pc, metadata)
-			return true
+			proxy, rule, err := resolveMetadata(metadata)
+			if err != nil {
+				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
+				return nil, nil, err
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
+			defer cancel()
+			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
+				return proxy.ListenPacketContext(ctx, metadata.Pure())
+			}, func(err error) {
+				logMetadataErr(metadata, rule, proxy, err)
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			logMetadata(metadata, rule, rawPc)
+
+			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
+
+			if rawPc.Chains().Last() == "REJECT-DROP" {
+				_ = pc.Close()
+				return nil, nil, errors.New("rejected drop packet")
+			}
+
+			oAddrPort := metadata.AddrPort()
+			writeBackProxy := nat.NewWriteBackProxy(packet)
+
+			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort, fAddr)
+			return pc, writeBackProxy, nil
 		}
-		return false
-	}
 
-	if handle() {
-		return
-	}
-
-	lockKey := key + "-lock"
-	cond, loaded := natTable.GetOrCreateLock(lockKey)
-
-	go func() {
-		if loaded {
-			cond.L.Lock()
-			cond.Wait()
-			handle()
-			cond.L.Unlock()
-			return
-		}
-
-		defer func() {
-			natTable.Delete(lockKey)
-			cond.Broadcast()
+		go func() {
+			pc, proxy, err := dial()
+			if err != nil {
+				sender.Close()
+				natTable.Delete(key)
+				return
+			}
+			sender.Process(pc, proxy)
 		}()
-
-		pCtx := icontext.NewPacketConnContext(metadata)
-		proxy, rule, err := resolveMetadata(pCtx, metadata)
-		if err != nil {
-			log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
-		defer cancel()
-		rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
-			return proxy.ListenPacketContext(ctx, metadata.Pure())
-		}, func(err error) {
-			if rule == nil {
-				log.Warnln(
-					"[UDP] dial %s %s --> %s error: %s",
-					proxy.Name(),
-					metadata.SourceDetail(),
-					metadata.RemoteAddress(),
-					err.Error(),
-				)
-			} else {
-				log.Warnln("[UDP] dial %s (match %s/%s) %s --> %s error: %s", proxy.Name(), rule.RuleType().String(), rule.Payload(), metadata.SourceDetail(), metadata.RemoteAddress(), err.Error())
-			}
-		})
-		if err != nil {
-			return
-		}
-		pCtx.InjectPacketConn(rawPc)
-
-		pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule)
-
-		switch true {
-		case metadata.SpecialProxy != "":
-			log.Infoln("[UDP] %s --> %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), metadata.SpecialProxy)
-		case rule != nil:
-			if rule.Payload() != "" {
-				log.Infoln("[UDP] %s --> %s match %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), rawPc.Chains().String())
-			} else {
-				log.Infoln("[UDP] %s --> %s match %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), rule.Payload(), rawPc.Chains().String())
-			}
-		case mode == Global:
-			log.Infoln("[UDP] %s --> %s using GLOBAL", metadata.SourceDetail(), metadata.RemoteAddress())
-		case mode == Direct:
-			log.Infoln("[UDP] %s --> %s using DIRECT", metadata.SourceDetail(), metadata.RemoteAddress())
-		default:
-			log.Infoln("[UDP] %s --> %s doesn't match any rule using DIRECT", metadata.SourceDetail(), metadata.RemoteAddress())
-		}
-
-		oAddr := metadata.DstIP
-		natTable.Set(key, pc)
-
-		go handleUDPToLocal(packet, pc, key, oAddr, fAddr)
-
-		handle()
-	}()
+	}
+	sender.Send(packet) // nonblocking
 }
 
 func handleTCPConn(connCtx C.ConnContext) {
+	if !isHandle(connCtx.Metadata().Type) {
+		_ = connCtx.Conn().Close()
+		return
+	}
+
 	defer func(conn net.Conn) {
 		_ = conn.Close()
 	}(connCtx.Conn())
@@ -361,16 +452,42 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	preHandleFailed := false
 	if err := preHandleMetadata(metadata); err != nil {
 		log.Debugln("[Metadata PreHandle] error: %s", err)
+		preHandleFailed = true
+	}
+
+	conn := connCtx.Conn()
+	conn.ResetPeeked() // reset before sniffer
+	if sniffingEnable && snifferDispatcher.Enable() {
+		// Try to sniff a domain when `preHandleMetadata` failed, this is usually
+		// caused by a "Fake DNS record missing" error when enhanced-mode is fake-ip.
+		if snifferDispatcher.TCPSniff(conn, metadata) {
+			// we now have a domain name
+			preHandleFailed = false
+		}
+	}
+
+	// If both trials have failed, we can do nothing but give up
+	if preHandleFailed {
+		log.Debugln("[Metadata PreHandle] failed to sniff a domain for connection %s --> %s, give up",
+			metadata.SourceDetail(), metadata.RemoteAddress())
 		return
 	}
 
-	if sniffer.Dispatcher.Enable() && sniffingEnable {
-		sniffer.Dispatcher.TCPSniff(connCtx.Conn(), metadata)
+	peekMutex := sync.Mutex{}
+	if !conn.Peeked() {
+		peekMutex.Lock()
+		go func() {
+			defer peekMutex.Unlock()
+			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			_, _ = conn.Peek(1)
+			_ = conn.SetReadDeadline(time.Time{})
+		}()
 	}
 
-	proxy, rule, err := resolveMetadata(connCtx, metadata)
+	proxy, rule, err := resolveMetadata(metadata)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
 		return
@@ -378,8 +495,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 
 	dialMetadata := metadata
 	if len(metadata.Host) > 0 {
-		if node := resolver.DefaultHosts.Search(metadata.Host); node != nil {
-			if dstIp := node.Data(); !FakeIPRange().Contains(dstIp) {
+		if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+			if dstIp, _ := node.RandIP(); !FakeIPRange().Contains(dstIp) {
 				dialMetadata.DstIP = dstIp
 				dialMetadata.DNSMode = C.DNSHosts
 				dialMetadata = dialMetadata.Pure()
@@ -387,54 +504,86 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}
 	}
 
+	var peekBytes []byte
+	var peekLen int
+
 	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
 	defer cancel()
-	remoteConn, err := retry(ctx, func(ctx context.Context) (C.Conn, error) {
-		return proxy.DialContext(ctx, dialMetadata)
-	}, func(err error) {
-		if rule == nil {
-			log.Warnln(
-				"[TCP] dial %s %s --> %s error: %s",
-				proxy.Name(),
-				metadata.SourceDetail(),
-				metadata.RemoteAddress(),
-				err.Error(),
-			)
-		} else {
-			log.Warnln("[TCP] dial %s (match %s/%s) %s --> %s error: %s", proxy.Name(), rule.RuleType().String(), rule.Payload(), metadata.SourceDetail(), metadata.RemoteAddress(), err.Error())
+	remoteConn, err := retry(ctx, func(ctx context.Context) (remoteConn C.Conn, err error) {
+		remoteConn, err = proxy.DialContext(ctx, dialMetadata)
+		if err != nil {
+			return
 		}
+
+		if N.NeedHandshake(remoteConn) {
+			defer func() {
+				for _, chain := range remoteConn.Chains() {
+					if chain == "REJECT" {
+						err = nil
+						return
+					}
+				}
+				if err != nil {
+					remoteConn = nil
+				}
+			}()
+			peekMutex.Lock()
+			defer peekMutex.Unlock()
+			peekBytes, _ = conn.Peek(conn.Buffered())
+			_, err = remoteConn.Write(peekBytes)
+			if err != nil {
+				return
+			}
+			if peekLen = len(peekBytes); peekLen > 0 {
+				_, _ = conn.Discard(peekLen)
+			}
+		}
+		return
+	}, func(err error) {
+		logMetadataErr(metadata, rule, proxy, err)
 	})
 	if err != nil {
 		return
 	}
+	logMetadata(metadata, rule, remoteConn)
 
-	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule)
+	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, 0, int64(peekLen), true)
 	defer func(remoteConn C.Conn) {
 		_ = remoteConn.Close()
 	}(remoteConn)
 
-	switch true {
+	_ = conn.SetReadDeadline(time.Now()) // stop unfinished peek
+	peekMutex.Lock()
+	defer peekMutex.Unlock()
+	_ = conn.SetReadDeadline(time.Time{}) // reset
+	handleSocket(conn, remoteConn)
+}
+
+func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err error) {
+	if rule == nil {
+		log.Warnln("[%s] dial %s %s --> %s error: %s", strings.ToUpper(metadata.NetWork.String()), proxy.Name(), metadata.SourceDetail(), metadata.RemoteAddress(), err.Error())
+	} else {
+		log.Warnln("[%s] dial %s (match %s/%s) %s --> %s error: %s", strings.ToUpper(metadata.NetWork.String()), proxy.Name(), rule.RuleType().String(), rule.Payload(), metadata.SourceDetail(), metadata.RemoteAddress(), err.Error())
+	}
+}
+
+func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
+	switch {
 	case metadata.SpecialProxy != "":
-		log.Infoln("[TCP] %s --> %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), metadata.SpecialProxy)
+		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), metadata.SpecialProxy)
 	case rule != nil:
 		if rule.Payload() != "" {
-			log.Infoln("[TCP] %s --> %s match %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), remoteConn.Chains().String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), remoteConn.Chains().String())
 		} else {
-			log.Infoln("[TCP] %s --> %s match %s using %s", metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
 	case mode == Global:
-		log.Infoln("[TCP] %s --> %s using GLOBAL", metadata.SourceDetail(), metadata.RemoteAddress())
+		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	case mode == Direct:
-		log.Infoln("[TCP] %s --> %s using DIRECT", metadata.SourceDetail(), metadata.RemoteAddress())
+		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
-		log.Infoln(
-			"[TCP] %s --> %s doesn't match any rule using DIRECT",
-			metadata.SourceDetail(),
-			metadata.RemoteAddress(),
-		)
+		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().Last())
 	}
-
-	handleSocket(connCtx, remoteConn)
 }
 
 func shouldResolveIP(rule C.Rule, metadata *C.Metadata) bool {
@@ -445,12 +594,12 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
 	var (
-		resolved     bool
-		processFound bool
+		resolved             bool
+		attemptProcessLookup = metadata.Type != C.INNER
 	)
 
-	if node := resolver.DefaultHosts.Search(metadata.Host); node != nil {
-		metadata.DstIP = node.Data()
+	if node, ok := resolver.DefaultHosts.Search(metadata.Host, false); ok {
+		metadata.DstIP, _ = node.RandIP()
 		resolved = true
 	}
 
@@ -470,16 +619,30 @@ func match(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
 			}()
 		}
 
-		if !findProcessMode.Off() && !processFound && (findProcessMode.Always() || rule.ShouldFindProcess()) {
-			srcPort, err := strconv.ParseUint(metadata.SrcPort, 10, 16)
-			uid, path, err := P.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(srcPort))
-			if err != nil {
-				log.Debugln("[Process] find process %s: %v", metadata.String(), err)
+		if attemptProcessLookup && !findProcessMode.Off() && (findProcessMode.Always() || rule.ShouldFindProcess()) {
+			attemptProcessLookup = false
+			if !features.CMFA {
+				// normal check for process
+				uid, path, err := P.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+				if err != nil {
+					log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+				} else {
+					metadata.Process = filepath.Base(path)
+					metadata.ProcessPath = path
+					metadata.Uid = uid
+
+					if pkg, err := P.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
+						metadata.Process = pkg
+					}
+				}
 			} else {
-				metadata.Process = filepath.Base(path)
-				metadata.ProcessPath = path
-				metadata.Uid = uid
-				processFound = true
+				// check package names
+				pkg, err := P.FindPackageName(metadata)
+				if err != nil {
+					log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+				} else {
+					metadata.Process = pkg
+				}
 			}
 		}
 
@@ -524,23 +687,36 @@ func getRules(metadata *C.Metadata) []C.Rule {
 	}
 }
 
-func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
-	b := &backoff.Backoff{
-		Min:    10 * time.Millisecond,
-		Max:    1 * time.Second,
-		Factor: 2,
-		Jitter: true,
+func shouldStopRetry(err error) bool {
+	if errors.Is(err, resolver.ErrIPNotFound) {
+		return true
 	}
+	if errors.Is(err, resolver.ErrIPVersion) {
+		return true
+	}
+	if errors.Is(err, resolver.ErrIPv6Disabled) {
+		return true
+	}
+	if errors.Is(err, loopback.ErrReject) {
+		return true
+	}
+	return false
+}
+
+func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
+	s := slowdown.New()
 	for i := 0; i < 10; i++ {
 		t, err = ft(ctx)
 		if err != nil {
 			if fe != nil {
 				fe(err)
 			}
-			select {
-			case <-time.After(b.Duration()):
+			if shouldStopRetry(err) {
+				return
+			}
+			if s.Wait(ctx) == nil {
 				continue
-			case <-ctx.Done():
+			} else {
 				return
 			}
 		} else {

@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	"github.com/Dreamacro/clash/common/nnip"
-	"github.com/Dreamacro/clash/log"
+	"github.com/metacubex/mihomo/common/nnip"
+	"github.com/metacubex/mihomo/log"
 
 	"golang.org/x/sys/windows"
 )
@@ -67,7 +67,7 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 		err := initWin32API()
 		if err != nil {
 			log.Errorln("Initialize PROCESS-NAME failed: %s", err.Error())
-			log.Warnln("All PROCESS-NAMES rules will be skiped")
+			log.Warnln("All PROCESS-NAMES rules will be skipped")
 			return
 		}
 	})
@@ -180,7 +180,7 @@ func newSearcher(isV4, isTCP bool) *searcher {
 func getTransportTable(fn uintptr, family int, class int) ([]byte, error) {
 	for size, buf := uint32(8), make([]byte, 8); ; {
 		ptr := unsafe.Pointer(&buf[0])
-		err, _, _ := syscall.SyscallN(fn, uintptr(ptr), uintptr(unsafe.Pointer(&size)), 0, uintptr(family), uintptr(class), 0)
+		err, _, _ := syscall.Syscall6(fn, 6, uintptr(ptr), uintptr(unsafe.Pointer(&size)), 0, uintptr(family), uintptr(class), 0)
 
 		switch err {
 		case 0:
@@ -215,13 +215,13 @@ func getExecPathFromPID(pid uint32) (string, error) {
 
 	buf := make([]uint16, syscall.MAX_LONG_PATH)
 	size := uint32(len(buf))
-	r1, _, err := syscall.SyscallN(
-		queryProcName,
+	r1, _, err := syscall.Syscall6(
+		queryProcName, 4,
 		uintptr(h),
-		uintptr(1),
+		uintptr(0),
 		uintptr(unsafe.Pointer(&buf[0])),
 		uintptr(unsafe.Pointer(&size)),
-	)
+		0, 0)
 	if r1 == 0 {
 		return "", err
 	}

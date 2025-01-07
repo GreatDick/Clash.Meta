@@ -5,8 +5,12 @@ const (
 	Domain RuleType = iota
 	DomainSuffix
 	DomainKeyword
+	DomainRegex
 	GEOSITE
 	GEOIP
+	SrcGEOIP
+	IPASN
+	SrcIPASN
 	IPCIDR
 	SrcIPCIDR
 	IPSuffix
@@ -14,12 +18,17 @@ const (
 	SrcPort
 	DstPort
 	InPort
-	Process
+	DSCP
+	InUser
+	InName
+	InType
+	ProcessName
 	ProcessPath
+	ProcessNameRegex
+	ProcessPathRegex
 	RuleSet
 	Network
 	Uid
-	INTYPE
 	SubRules
 	MATCH
 	AND
@@ -37,10 +46,18 @@ func (rt RuleType) String() string {
 		return "DomainSuffix"
 	case DomainKeyword:
 		return "DomainKeyword"
+	case DomainRegex:
+		return "DomainRegex"
 	case GEOSITE:
 		return "GeoSite"
 	case GEOIP:
 		return "GeoIP"
+	case SrcGEOIP:
+		return "SrcGeoIP"
+	case IPASN:
+		return "IPASN"
+	case SrcIPASN:
+		return "SrcIPASN"
 	case IPCIDR:
 		return "IPCIDR"
 	case SrcIPCIDR:
@@ -55,20 +72,30 @@ func (rt RuleType) String() string {
 		return "DstPort"
 	case InPort:
 		return "InPort"
-	case Process:
-		return "Process"
+	case InUser:
+		return "InUser"
+	case InName:
+		return "InName"
+	case InType:
+		return "InType"
+	case ProcessName:
+		return "ProcessName"
 	case ProcessPath:
 		return "ProcessPath"
+	case ProcessNameRegex:
+		return "ProcessNameRegex"
+	case ProcessPathRegex:
+		return "ProcessPathRegex"
 	case MATCH:
 		return "Match"
 	case RuleSet:
 		return "RuleSet"
 	case Network:
 		return "Network"
+	case DSCP:
+		return "DSCP"
 	case Uid:
 		return "Uid"
-	case INTYPE:
-		return "InType"
 	case SubRules:
 		return "SubRules"
 	case AND:
@@ -89,4 +116,10 @@ type Rule interface {
 	Payload() string
 	ShouldResolveIP() bool
 	ShouldFindProcess() bool
+	ProviderNames() []string
+}
+
+type RuleGroup interface {
+	Rule
+	GetRecodeSize() int
 }

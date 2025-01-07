@@ -6,7 +6,7 @@ import (
 	"net/netip"
 	"syscall"
 
-	"github.com/Dreamacro/clash/component/iface"
+	"github.com/metacubex/mihomo/component/iface"
 
 	"golang.org/x/sys/unix"
 )
@@ -46,7 +46,7 @@ func bindIfaceToDialer(ifaceName string, dialer *net.Dialer, _ string, _ netip.A
 	return nil
 }
 
-func bindIfaceToListenConfig(ifaceName string, lc *net.ListenConfig, _, address string) (string, error) {
+func bindIfaceToListenConfig(ifaceName string, lc *net.ListenConfig, _, address string, rAddrPort netip.AddrPort) (string, error) {
 	ifaceObj, err := iface.ResolveInterface(ifaceName)
 	if err != nil {
 		return "", err
